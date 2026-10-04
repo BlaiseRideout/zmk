@@ -26,6 +26,8 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/split/bluetooth/uuid.h>
 #include <zmk/split/bluetooth/service.h>
 
+#include "peripheral.h"
+
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_PERIPHERAL_HID_INDICATORS)
 #include <zmk/events/hid_indicators_changed.h>
 #endif // IS_ENABLED(CONFIG_ZMK_SPLIT_PERIPHERAL_HID_INDICATORS)
@@ -310,6 +312,27 @@ static int zmk_split_bt_sensor_triggered(uint8_t sensor_index,
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT)
 
+struct input_event_notify_item {
+    uint16_t attr_index;
+    struct zmk_split_input_event_payload payload;
+};
+
+K_MSGQ_DEFINE(input_event_msgq, sizeof(struct input_event_notify_item),
+              CONFIG_ZMK_INPUT_SPLIT_MSG_QUEUE_SIZE, 4);
+
+static void send_input_event_callback(struct k_work *work) {
+    struct input_event_notify_item item;
+    while (k_msgq_get(&input_event_msgq, &item, K_NO_WAIT) == 0) {
+        int err = bt_gatt_notify(NULL, &split_svc.attrs[item.attr_index], &item.payload,
+                                 sizeof(item.payload));
+        if (err) {
+            LOG_ERR("Error notifying input event %d", err);
+        }
+    }
+}
+
+static K_WORK_DEFINE(service_input_notify_work, send_input_event_callback);
+
 static int zmk_split_bt_report_input(uint8_t reg, uint8_t type, uint16_t code, int32_t value,
                                      bool sync) {
 
@@ -324,7 +347,24 @@ static int zmk_split_bt_report_input(uint8_t reg, uint8_t type, uint16_t code, i
                 .sync = sync ? 1 : 0,
             };
 
-            return bt_gatt_notify(NULL, &split_svc.attrs[i], &payload, sizeof(payload));
+            struct input_event_notify_item item = {.attr_index = (uint16_t)i, .payload = payload};
+            int err = k_msgq_put(&input_event_msgq, &item, K_NO_WAIT);
+
+            if (err == 0) {
+                k_work_submit_to_queue(&service_work_q, &service_input_notify_work);
+                return 0;
+            } else {
+                LOG_WRN("Input event queue full, dropping one and retry");
+
+                struct input_event_notify_item discarded;
+                k_msgq_get(&input_event_msgq, &discarded, K_NO_WAIT);
+                err = k_msgq_put(&input_event_msgq, &item, K_NO_WAIT);
+
+                if (err != 0) {
+                    LOG_WRN("Failed to queue input event (%d)", err);
+                    return err;
+                }
+            }
         }
     }
     return -ENODEV;
@@ -343,7 +383,8 @@ static int service_init(void) {
 
 SYS_INIT(service_init, APPLICATION, CONFIG_ZMK_BLE_INIT_PRIORITY);
 
-static int zmk_peripheral_ble_report_event(const struct zmk_split_transport_peripheral_event *ev) {
+int zmk_split_transport_peripheral_bt_report_event(
+    const struct zmk_split_transport_peripheral_event *ev) {
     switch (ev->type) {
     case ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_KEY_POSITION_EVENT:
         if (ev->data.key_position_event.pressed) {
@@ -379,12 +420,6 @@ static int zmk_peripheral_ble_report_event(const struct zmk_split_transport_peri
 
     return 0;
 }
-
-static const struct zmk_split_transport_peripheral_api peripheral_api = {
-    .report_event = zmk_peripheral_ble_report_event,
-};
-
-ZMK_SPLIT_TRANSPORT_PERIPHERAL_REGISTER(bt_peripheral, &peripheral_api);
 
 static ssize_t split_svc_run_behavior(struct bt_conn *conn, const struct bt_gatt_attr *attrs,
                                       const void *buf, uint16_t len, uint16_t offset,
@@ -428,7 +463,8 @@ static ssize_t split_svc_run_behavior(struct bt_conn *conn, const struct bt_gatt
                 cmd.data.invoke_behavior.param1, cmd.data.invoke_behavior.param2,
                 cmd.data.invoke_behavior.state);
 
-        int err = zmk_split_transport_peripheral_command_handler(&bt_peripheral, cmd);
+        int err = zmk_split_transport_peripheral_command_handler(
+            zmk_split_transport_peripheral_bt(), cmd);
 
         if (err) {
             LOG_ERR("Failed to invoke behavior %s: %d", payload->behavior_dev, err);
